@@ -29,8 +29,8 @@ WATCHLIST = [
     # code         : 6 位代码；secid : 上交所 = 1.xxxxxx，深交所 = 0.xxxxxx
     # target_price : 目标买入价（元），跌破就提醒。None 表示不按单一价格判断。
     # tiers        : 阶梯买入位（元），逐档提醒，破一档报一次，破过的不重复报。
-    # dps          : 每股年度分红（元），填了才自动算股息率；None 表示不算。
-    # target_yield : 该标的自己的股息率门槛（%），不写就用下面的 TARGET_YIELD。
+    # dps          : 手工指定每股分红（元）；None = 自动按东方财富分红数据算近 12 个月 TTM
+    # target_yield : 该标的自己的股息率门槛（%），不写就不按股息率提醒（只显示）
 
     # 工商银行：跌破 8.00 元提醒
     {"code": "601398", "name": "工商银行", "secid": "1.601398",
@@ -48,7 +48,8 @@ WATCHLIST = [
     # {"code": "600036", "name": "招商银行", "secid": "1.600036", "target_price": 30.00, "dps": 1.97},
 ]
 
-TARGET_YIELD = 5.0        # 全局默认股息率门槛（%）；标的自己写了 target_yield 就以它为准
+TARGET_YIELD = None       # 全局默认股息率门槛（%）；None = 只显示不判断（标的写 target_yield 才提醒）
+DIVIDEND_CACHE_DAYS = 7   # 分红数据缓存天数，过期后重新抓
 DROP_ALERT = -2.0         # 单日跌幅 <= -2.0% 提醒一次（机会还是风险你自己判断）
 MODE = "daily"            # "daily" = 每个交易日都推一条日报；"signal" = 只在触发时推
 SIGNAL_COOLDOWN_DAYS = 7  # signal 模式下，同一个信号多少天内不重复推
@@ -150,9 +151,83 @@ def fetch_quote(item):
     raise RuntimeError(f"{item['code']} 两个行情源都拿不到数据")
 
 
+# ---------- 分红数据：自动算 TTM 股息率 ----------
+
+DIVIDEND_API = (
+    "https://datacenter-web.eastmoney.com/api/data/v1/get"
+    "?reportName=RPT_SHAREBONUS_DET&columns=ALL"
+    "&filter=(SECURITY_CODE%3D%22{code}%22)"
+    "&pageNumber=1&pageSize=20&sortColumns=EX_DIVIDEND_DATE&sortTypes=-1"
+    "&source=WEB&client=WEB"
+)
+
+
+def fetch_dividend_ttm(code, days=365):
+    """抓近 N 个月（除权日口径）的每股派息合计。ETF 无此数据，返回 None。"""
+    url = DIVIDEND_API.format(code=code)
+    raw = http_get(url, headers={"Referer": "https://data.eastmoney.com/"}, retries=2)
+    payload = json.loads(raw.decode("utf-8", "ignore")) or {}
+    rows = ((payload.get("result") or {}).get("data")) or []
+    today = datetime.now(BEIJING).date()
+    cutoff = today - timedelta(days=days)
+
+    total, items = 0.0, []
+    for r in rows:
+        ex = str(r.get("EX_DIVIDEND_DATE") or "")[:10]
+        per10 = r.get("PRETAX_BONUS_RMB")
+        if not ex or per10 in (None, ""):
+            continue
+        try:
+            exd = datetime.strptime(ex, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if exd > today or exd < cutoff:
+            continue
+        per_share = float(per10) / 10.0          # 接口给的是"每 10 股派 X 元"
+        total += per_share
+        items.append({
+            "ex_date": ex,
+            "per_share": round(per_share, 4),
+            "plan": r.get("IMPL_PLAN_PROFILE"),
+        })
+
+    return {
+        "ttm_dps": round(total, 4) if items else None,
+        "items": items,
+        "checked_at": today.isoformat(),
+    }
+
+
+def resolve_dps(item, cache):
+    """优先用配置里手写的 dps；否则用分红接口算出的 TTM，带 7 天缓存。"""
+    if item.get("dps"):
+        return float(item["dps"]), {"source": "手工填写", "items": []}
+
+    code = item["code"]
+    c = cache.get(code) or {}
+    today = datetime.now(BEIJING).date()
+    fresh = False
+    try:
+        checked = datetime.strptime(str(c.get("checked_at", "")), "%Y-%m-%d").date()
+        fresh = (today - checked).days < DIVIDEND_CACHE_DAYS
+    except ValueError:
+        fresh = False
+
+    if fresh:
+        return c.get("ttm_dps"), {"source": "缓存", "items": c.get("items") or []}
+
+    try:
+        info = fetch_dividend_ttm(code)
+        cache[code] = info
+        return info["ttm_dps"], {"source": "东方财富", "items": info["items"]}
+    except Exception as e:  # noqa: BLE001
+        log(f"  分红数据抓取失败（{code}）：{e}，改用旧缓存")
+        return c.get("ttm_dps"), {"source": "旧缓存", "items": c.get("items") or []}
+
+
 # ---------- 判断 ----------
 
-def evaluate(item, q, fired_tiers=None):
+def evaluate(item, q, fired_tiers=None, dps_auto=None):
     """返回 (是否触发, 原因列表, 标签列表, 展示数据, 本次新跌破的档位)"""
     reasons, tags = [], []
     price = q["price"]
@@ -191,11 +266,16 @@ def evaluate(item, q, fired_tiers=None):
             # 统一语义：正数 = 现价还要跌这么多才到下一档
             gap = (price / upcoming - 1) * 100
 
+    dps_used = None
     if item.get("dps"):
-        yield_pct = float(item["dps"]) / price * 100
-        limit = float(item.get("target_yield") or TARGET_YIELD)
-        if yield_pct >= limit:
-            reasons.append(f"股息率 {yield_pct:.2f}% ≥ {limit:g}%")
+        dps_used = float(item["dps"])
+    elif dps_auto:
+        dps_used = float(dps_auto)
+    if dps_used:
+        yield_pct = dps_used / price * 100
+        limit = item.get("target_yield") or TARGET_YIELD
+        if limit and yield_pct >= float(limit):
+            reasons.append(f"股息率 {yield_pct:.2f}% ≥ {float(limit):g}%")
             tags.append("yield_high")
 
     if pct is not None and pct <= DROP_ALERT:
@@ -206,6 +286,7 @@ def evaluate(item, q, fired_tiers=None):
         "price": price,
         "pct": pct,
         "yield": yield_pct,
+        "dps": dps_used,
         "gap": gap,
         "target": target,
         "tiers": tier_state,
@@ -277,7 +358,7 @@ def build_message(date_str, rows, is_trading_day, quote_time):
     lines = []
     lines.append(f"**{date_str} 收盘播报**" + (f"（数据时间 {quote_time}）" if quote_time else ""))
     lines.append("")
-    lines.append("| 标的 | 现价 | 涨跌 | 股息率 | 距目标 |")
+    lines.append("| 标的 | 现价 | 涨跌 | 股息率(TTM) | 距目标 |")
     lines.append("| --- | --- | --- | --- | --- |")
     for r in rows:
         pct = "—" if r["pct"] is None else f"{r['pct']:+.2f}%"
@@ -314,6 +395,18 @@ def build_message(date_str, rows, is_trading_day, quote_time):
         lines.append("今日无触发条件。")
         lines.append("")
 
+    div_rows = [r for r in rows if r.get("dps")]
+    if div_rows:
+        lines.append("**股息率口径**：近 12 个月每股派息（含税）÷ 现价")
+        for r in div_rows:
+            items = (r.get("div") or {}).get("items") or []
+            if items:
+                detail = " + ".join(f"{it['ex_date'][5:]} 派 {it['per_share']:.4f}" for it in items)
+            else:
+                detail = "配置里手工填写"
+            lines.append(f"- {r['name']}：{r['dps']:.4f} 元（{detail}）")
+        lines.append("")
+
     if not is_trading_day:
         lines.append("> 提示：行情时间不是今天，可能是休市日，本条仅作确认。")
         lines.append("")
@@ -338,11 +431,15 @@ def main():
     # 先读状态：阶梯档位去重要用历史记录
     state = load_state()
     fired_map = state.get("tiers", {}) or {}
+    div_cache = state.get("dividend", {}) or {}
     for item in WATCHLIST:
         log(f"抓取 {item['name']}（{item['code']}）")
         try:
             q = fetch_quote(item)
-            triggered, reasons, tags, calc, new_fired = evaluate(item, q, fired_map.get(item["code"]))
+            dps_auto, div_info = resolve_dps(item, div_cache)
+            if dps_auto:
+                log(f"  股息率用的每股派息 {dps_auto} 元（{div_info['source']}，{len(div_info['items'])} 次派息）")
+            triggered, reasons, tags, calc, new_fired = evaluate(item, q, fired_map.get(item["code"]), dps_auto)
             if new_fired:
                 fired_map[item["code"]] = sorted(
                     set(fired_map.get(item["code"], [])) | set(new_fired), reverse=True
@@ -352,7 +449,8 @@ def main():
             rows.append({
                 "code": q["code"], "name": q["name"],
                 "price": calc["price"], "price_str": q.get("price_str"), "pct": calc["pct"],
-                "yield": calc["yield"], "gap": calc["gap"], "tiers": calc["tiers"],
+                "yield": calc["yield"], "dps": calc["dps"], "div": div_info,
+                "gap": calc["gap"], "tiers": calc["tiers"],
                 "triggered": triggered, "reasons": reasons, "tags": tags,
             })
             log(f"  {q['name']} {q['price']:.3f} "
@@ -408,6 +506,8 @@ def main():
     state["last_trading_day"] = is_trading_day
     if fired_map:
         state["tiers"] = fired_map
+    if div_cache:
+        state["dividend"] = div_cache
 
     print("\n================ 即将推送的内容 ================")
     print("标题：" + title)
