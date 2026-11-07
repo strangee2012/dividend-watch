@@ -26,17 +26,29 @@ STATE_FILE = os.path.join(ROOT, "state", "state.json")
 #  这一段是唯一需要你改的地方
 # ============================================================
 WATCHLIST = [
-    # code : 6 位代码；secid : 上交所 = 1.xxxxxx，深交所 = 0.xxxxxx
-    # target_price : 你心里的目标买入价（元）。设为 None 表示不按价格判断。
-    # dps : 每股年度分红（元）。填了才会算股息率，None 表示不算。
-    {"code": "601398", "name": "工商银行",   "secid": "1.601398", "target_price": None, "dps": None},
-    {"code": "600900", "name": "长江电力",   "secid": "1.600900", "target_price": None, "dps": None},
-    {"code": "588000", "name": "科创50ETF", "secid": "1.588000", "target_price": None, "dps": None},
+    # code         : 6 位代码；secid : 上交所 = 1.xxxxxx，深交所 = 0.xxxxxx
+    # target_price : 目标买入价（元），跌破就提醒。None 表示不按单一价格判断。
+    # tiers        : 阶梯买入位（元），逐档提醒，破一档报一次，破过的不重复报。
+    # dps          : 每股年度分红（元），填了才自动算股息率；None 表示不算。
+    # target_yield : 该标的自己的股息率门槛（%），不写就用下面的 TARGET_YIELD。
+
+    # 工商银行：跌破 8.00 元提醒
+    {"code": "601398", "name": "工商银行", "secid": "1.601398",
+     "target_price": 8.00, "dps": None},
+
+    # 长江电力：TTM 股息率 ≥ 4%（你给的换算约等于 25 元以下），先按 25.00 元提醒
+    {"code": "600900", "name": "长江电力", "secid": "1.600900",
+     "target_price": 25.00, "dps": None, "target_yield": 4.0},
+
+    # 科创50ETF：三档阶梯 1.22 / 1.12 / 1.03，逐档提醒
+    {"code": "588000", "name": "科创50ETF", "secid": "1.588000",
+     "target_price": None, "dps": None, "tiers": [1.22, 1.12, 1.03]},
+
     # 加新标的照着上面的格式加一行就行，例如：
     # {"code": "600036", "name": "招商银行", "secid": "1.600036", "target_price": 30.00, "dps": 1.97},
 ]
 
-TARGET_YIELD = 5.0        # 股息率 >= 5.0% 视为触发（该标的必须填了 dps 才生效）
+TARGET_YIELD = 5.0        # 全局默认股息率门槛（%）；标的自己写了 target_yield 就以它为准
 DROP_ALERT = -2.0         # 单日跌幅 <= -2.0% 提醒一次（机会还是风险你自己判断）
 MODE = "daily"            # "daily" = 每个交易日都推一条日报；"signal" = 只在触发时推
 SIGNAL_COOLDOWN_DAYS = 7  # signal 模式下，同一个信号多少天内不重复推
@@ -140,25 +152,50 @@ def fetch_quote(item):
 
 # ---------- 判断 ----------
 
-def evaluate(item, q):
-    """返回 (是否触发, 触发原因列表, 展示用数据)"""
+def evaluate(item, q, fired_tiers=None):
+    """返回 (是否触发, 原因列表, 标签列表, 展示数据, 本次新跌破的档位)"""
     reasons, tags = [], []
     price = q["price"]
     pct = q["pct"]
     yield_pct = None
+    gap = None
 
-    if item.get("target_price"):
-        gap = (price / float(item["target_price"]) - 1) * 100
-        if price <= float(item["target_price"]):
-            reasons.append(f"跌破目标价 {item['target_price']:.2f}")
+    target = item.get("target_price")
+    if target:
+        gap = (price / float(target) - 1) * 100
+        if price <= float(target):
+            reasons.append(f"跌破目标价 {target:.2f}")
             tags.append("price_below")
-    else:
-        gap = None
+
+    # ---- 阶梯买入位：逐档提醒 ----
+    tiers = [float(t) for t in (item.get("tiers") or [])]
+    fired = [float(t) for t in (fired_tiers or [])]
+    new_fired = []
+    tier_state = None
+    if tiers:
+        for i, t in enumerate(tiers, 1):
+            if price <= t and t not in fired:
+                reasons.append(f"跌破第 {i} 档 {t:.2f}")
+                tags.append(f"tier{i}")
+                new_fired.append(t)
+        fired_all = sorted(set(fired) | set(new_fired), reverse=True)
+        pending = [t for t in tiers if t not in fired_all]
+        # 价格是从上往下走的：下一个会遇到的是"还没破的最高一档"
+        upcoming = max(pending) if pending else None
+        tier_state = {
+            "levels": tiers,
+            "fired": fired_all,
+            "upcoming": upcoming,
+        }
+        if gap is None and upcoming is not None:
+            # 统一语义：正数 = 现价还要跌这么多才到下一档
+            gap = (price / upcoming - 1) * 100
 
     if item.get("dps"):
         yield_pct = float(item["dps"]) / price * 100
-        if yield_pct >= TARGET_YIELD:
-            reasons.append(f"股息率 {yield_pct:.2f}% ≥ {TARGET_YIELD}%")
+        limit = float(item.get("target_yield") or TARGET_YIELD)
+        if yield_pct >= limit:
+            reasons.append(f"股息率 {yield_pct:.2f}% ≥ {limit:g}%")
             tags.append("yield_high")
 
     if pct is not None and pct <= DROP_ALERT:
@@ -170,8 +207,9 @@ def evaluate(item, q):
         "pct": pct,
         "yield": yield_pct,
         "gap": gap,
-        "target": item.get("target_price"),
-    }
+        "target": target,
+        "tiers": tier_state,
+    }, new_fired
 
 
 # ---------- 状态（去重）----------
@@ -253,6 +291,20 @@ def build_message(date_str, rows, is_trading_day, quote_time):
         lines.append(f"| {r['name']}{mark} | {px} | {pct} | {yld} | {gap} |")
     lines.append("")
 
+    # 阶梯档位进度
+    ladders = [r for r in rows if r.get("tiers")]
+    if ladders:
+        for r in ladders:
+            t = r["tiers"]
+            parts = [f"{lv:.2f}{'✅' if lv in t['fired'] else '⏳'}" for lv in t["levels"]]
+            nxt = t.get("upcoming")
+            if nxt:
+                tail = f"下一档 {nxt:.2f}（还需跌 {(r['price'] / nxt - 1) * 100:.1f}%）"
+            else:
+                tail = "三档全部已破"
+            lines.append(f"**{r['name']} 阶梯**：{' / '.join(parts)}　{tail}")
+        lines.append("")
+
     if triggered:
         lines.append("**触发信号**")
         for r in triggered:
@@ -283,22 +335,30 @@ def main():
 
     rows, errors = [], []
     quote_times = []
+    # 先读状态：阶梯档位去重要用历史记录
+    state = load_state()
+    fired_map = state.get("tiers", {}) or {}
     for item in WATCHLIST:
         log(f"抓取 {item['name']}（{item['code']}）")
         try:
             q = fetch_quote(item)
-            triggered, reasons, tags, calc = evaluate(item, q)
+            triggered, reasons, tags, calc, new_fired = evaluate(item, q, fired_map.get(item["code"]))
+            if new_fired:
+                fired_map[item["code"]] = sorted(
+                    set(fired_map.get(item["code"], [])) | set(new_fired), reverse=True
+                )
             if q["quote_time"]:
                 quote_times.append(q["quote_time"])
             rows.append({
                 "code": q["code"], "name": q["name"],
                 "price": calc["price"], "price_str": q.get("price_str"), "pct": calc["pct"],
-                "yield": calc["yield"], "gap": calc["gap"],
+                "yield": calc["yield"], "gap": calc["gap"], "tiers": calc["tiers"],
                 "triggered": triggered, "reasons": reasons, "tags": tags,
             })
             log(f"  {q['name']} {q['price']:.3f} "
                 f"{'' if q['pct'] is None else format(q['pct'], '+.2f') + '%'} "
-                f"[{q['source']}] {'触发' if triggered else '正常'}")
+                f"[{q['source']}] {'触发' if triggered else '正常'}"
+                + (f" 新破档位 {new_fired}" if new_fired else ""))
         except Exception as e:  # noqa: BLE001
             errors.append(f"{item['name']}（{item['code']}）：{e}")
             log(f"  失败：{e}")
@@ -324,7 +384,6 @@ def main():
         desp += "\n\n**部分标的取数失败**\n" + "\n".join(f"- {e}" for e in errors)
 
     # 是否要发
-    state = load_state()
     should_send = True
     if MODE == "signal":
         fingerprint = "|".join(sorted(
@@ -347,6 +406,8 @@ def main():
     state["last_run"] = today.strftime("%Y-%m-%d %H:%M:%S")
     state["last_quote_time"] = quote_time
     state["last_trading_day"] = is_trading_day
+    if fired_map:
+        state["tiers"] = fired_map
 
     print("\n================ 即将推送的内容 ================")
     print("标题：" + title)
